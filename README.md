@@ -1,2 +1,2 @@
 # libcloud-virtualbox
-LibCloud driver for VirtualBox
+LibCloud driver for VirtualBox, together with 
