@@ -1,0 +1,10 @@
+[run]
+source =
+       libcloud_virtualbox
+branch = True
+
+
+[paths]
+source =
+   src/
+   .tox/*/lib/python*/site-packages/

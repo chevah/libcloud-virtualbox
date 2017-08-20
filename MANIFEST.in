@@ -1,0 +1,2 @@
+graft src
+include LICENSE COPYING.CDDL *.rst tox.ini .coveragerc
