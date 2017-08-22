@@ -15,6 +15,7 @@ import unittest
 
 from libcloud.compute.base import (
     Node,
+    NodeAuthPassword,
     NodeImage,
     NodeLocation,
     NodeSize,
@@ -32,12 +33,11 @@ def _create_disk(path, size=1):
     """
     Create a disk medium and return it's UUID.
     """
-    target_path = os.path.join(*path)
     try:
         output = subprocess.check_output([
             'vboxmanage', 'createmedium', 'disk',
             '--size', str(size),
-            '--filename', target_path,
+            '--filename', path,
             ],
             stderr=subprocess.STDOUT,
             )
@@ -66,17 +66,21 @@ def _delete_disk(*path):
             'Failed to delete medium. %s' % (error.output))
 
 
-def _create_machine(name, medium_id):
+def _create_machine(name, medium_id, size_id='1_cpu-256_ram-30_disk'):
     """
-    Create a new VM attacehd to storage `medium_id`.
+    Create a new VM attached to storage `medium_id`.
     """
-    base_folder = os.path.abspath(os.path.join('test-tmp', 'vm'))
+    base_folder = _absolute_test_path('vm')
     output = subprocess.check_output([
         'vboxmanage', 'createvm', '--register',
         '--name', name,
         '--basefolder', base_folder,
         ])
     uuid = output.splitlines()[1].strip('UUID: ')
+
+    if size_id:
+        subprocess.check_output([
+            'vboxmanage', 'setextradata', uuid, 'libcloud_size', size_id])
 
     subprocess.check_output([
         'vboxmanage', 'storagectl', uuid, '--name', 'SATA',
@@ -122,6 +126,14 @@ def _delete_machine(uuid):
         raise AssertionError('Failed to delete machine. %s' % (output,))
 
 
+def _absolute_test_path(*parts):
+    """
+    Return the absolute path inside the test folder.
+    """
+    final_parts = ['test-tmp'] + list(parts)
+    return os.path.abspath(os.path.join(*final_parts))
+
+
 class VirtualBoxNodeDriverTests(unittest.TestCase):
     """
     Tests for VirtualBoxNodeDriver.
@@ -131,15 +143,13 @@ class VirtualBoxNodeDriverTests(unittest.TestCase):
     def setUpClass(cls):
         cls.sut = VirtualBoxNodeDriver('localhost', 18083, USERNAME, PASSWORD)
         # Inject testing paths.
-        cls.sut._images_path = os.path.abspath(os.path.join(
-            'test-tmp', 'images'))
-        cls.sut._volumes_path = os.path.abspath(os.path.join(
-            'test-tmp', 'volumes'))
+        cls.sut._images_path = _absolute_test_path('images')
+        cls.sut._volumes_path = _absolute_test_path('volumes')
 
     @classmethod
     def tearDownClass(cls):
         leftover_files = []
-        for root, dirs, files in os.walk('test-tmp', topdown=False):
+        for root, dirs, files in os.walk(_absolute_test_path(), topdown=False):
             for name in files:  # pragma: no cover
                 target = os.path.join(root, name)
                 leftover_files.append(target)
@@ -156,7 +166,7 @@ class VirtualBoxNodeDriverTests(unittest.TestCase):
         """
         Add a testing image and register for cleanup.
         """
-        uuid = _create_disk(['test-tmp', 'images', name])
+        uuid = _create_disk(_absolute_test_path('images', name))
         if cleanup:
             self.addCleanup(_delete_disk, uuid)
         return uuid
@@ -165,12 +175,15 @@ class VirtualBoxNodeDriverTests(unittest.TestCase):
         """
         Add a testing volume and register for cleanup.
         """
-        uuid = _create_disk(['test-tmp', 'volumes', name], size=size)
+        uuid = _create_disk(_absolute_test_path('volumes', name), size=size)
         if cleanup:
             self.addCleanup(_delete_disk, uuid)
         return uuid
 
-    def addMachine(self, name, no_volume=False, cleanup=True):
+    def addMachine(
+            self, name, size_id='1_cpu-256_ram-30_disk',
+            no_volume=False, cleanup=True
+            ):
         """
         Add a new virtual machine and register it for cleanup.
         """
@@ -181,7 +194,7 @@ class VirtualBoxNodeDriverTests(unittest.TestCase):
         else:
             medium_id = self.addVolume(
                 'test-hdd-for-%s' % (name,), cleanup=False)
-        uuid = _create_machine(name, medium_id)
+        uuid = _create_machine(name, medium_id, size_id)
 
         if cleanup:
             self.addCleanup(_delete_machine, uuid)
@@ -197,6 +210,13 @@ class VirtualBoxNodeDriverTests(unittest.TestCase):
         except StopIteration:
             return None
 
+    def getImage(self, image_id):
+        """
+        Return an existing image by id.
+        """
+        return next(  # pragma: no cover
+            i for i in self.sut.list_images() if i.id == image_id)
+
     def getVolume(self, volume_id):
         """
         Return an existing volume by id.
@@ -204,9 +224,26 @@ class VirtualBoxNodeDriverTests(unittest.TestCase):
         return next(  # pragma: no cover
             v for v in self.sut.list_volumes() if v.id == volume_id)
 
+    def getSize(self, size_id):
+        """
+        Return an existing size by id.
+        """
+        return next(  # pragma: no cover
+            s for s in self.sut.list_sizes() if s.id == size_id)
+
+    def assertSizeEqual(self, expected, actual):
+        """
+        Check that `expected` and `actual` are the same sizes.
+        """
+        self.assertIsInstance(
+            expected, NodeSize, 'Expected value is not a `NodeSize`.')
+        self.assertIsInstance(
+            actual, NodeSize, 'Actual value is not a `NodeSize`.')
+        self.assertEqual(repr(expected), repr(actual))
+
     def test_init_bad_connection(self):
         """
-        It will raise an exception when the connection failed.
+        It will raise and print an exception when the connection fails.
         """
         with self.assertRaises(RuntimeError) as context:
             VirtualBoxNodeDriver('127.0.0.1', 12345, '', '')
@@ -217,15 +254,17 @@ class VirtualBoxNodeDriverTests(unittest.TestCase):
 
     def test_list_sizes(self):
         """
-        Returns a list of `NodeSize`.
+        Returns a list of `NodeSize`, including the placeholder size.
         """
         sizes = self.sut.list_sizes()
 
         self.assertIsInstance(sizes[0], NodeSize)
         self.assertIs(self.sut, sizes[0].driver)
         # Do a simple check for a size which can be found on any host.
-        names = [size.name for size in sizes]
-        self.assertIn('1_cpu-256_ram-30_disk', names)
+        actual_sizes = {size.id: size for size in sizes}
+        self.assertIn('1_cpu-256_ram-30_disk', actual_sizes.keys())
+        # It has the extra unknown size placeholder.
+        self.assertEqual('Unknown', actual_sizes[''].name)
 
     def test_list_locations(self):
         """
@@ -256,8 +295,8 @@ class VirtualBoxNodeDriverTests(unittest.TestCase):
         self.assertItemsEqual([uuid1, uuid2], actual_ids)
         actual_names = [image.name for image in images]
         self.assertItemsEqual([
-            'libcloud_virtualbox_test-img1.vdi',
-            'libcloud_virtualbox_test-img2.vdi',
+            'libcloud_virtualbox_test-img1',
+            'libcloud_virtualbox_test-img2',
             ], actual_names)
         self.assertTrue(os.path.exists(images[0].extra['location']))
 
@@ -272,7 +311,7 @@ class VirtualBoxNodeDriverTests(unittest.TestCase):
         self.assertIsInstance(result, NodeImage)
         self.assertIs(self.sut, result.driver)
         self.assertEqual(uuid, result.id)
-        self.assertEqual('test-get-image.vdi', result.name)
+        self.assertEqual('test-get-image', result.name)
         self.assertTrue(os.path.exists(result.extra['location']))
 
     def test_delete_image(self):
@@ -305,7 +344,7 @@ class VirtualBoxNodeDriverTests(unittest.TestCase):
 
         self.assertIsInstance(result, NodeImage)
         self.assertIs(self.sut, result.driver)
-        self.assertEqual('test-create-image.vdi', result.name)
+        self.assertEqual('test-create-image', result.name)
         image_ids = [i.id for i in self.sut.list_images()]
         self.assertIn(result.id, image_ids)
         self.assertTrue(os.path.exists(result.extra['location']))
@@ -369,7 +408,7 @@ class VirtualBoxNodeDriverTests(unittest.TestCase):
         self.addCleanup(_delete_disk, volume.id)
 
         self.assertIsInstance(volume, StorageVolume)
-        self.assertEqual('test-create-volume.vdi', volume.name)
+        self.assertEqual('test-create-volume', volume.name)
         self.assertEqual(1, volume.size)
         # It is available in the list of volumes.
         volumes = self.sut.list_volumes()
@@ -430,16 +469,30 @@ class VirtualBoxNodeDriverTests(unittest.TestCase):
         It returns a list of `Node`.
         """
         node_id = self.addMachine('test-list_nodes')
+        node_no_size_id = self.addMachine(
+            'test-list_nodes-no-size', size_id='')
 
         result = self.sut.list_nodes()
 
         self.assertIsInstance(result[0], Node)
         self.assertIs(self.sut, result[0].driver)
-        actual_uuids = [n.id for n in result]
-        self.assertIn(node_id, actual_uuids)
-        node = self.getNode(node_id)
+        # It includes the newly created nodes.
+        actual_nodes = {n.id: n for n in result}
+        self.assertIn(node_id, actual_nodes.keys())
+        self.assertIn(node_no_size_id, actual_nodes.keys())
+        # Check how the node attributes are created.
+        node = actual_nodes[node_id]
         self.assertEqual('test-list_nodes', node.name)
         self.assertEqual(NodeState.STOPPED, node.state)
+        expected_size = self.getSize('1_cpu-256_ram-30_disk')
+        self.assertSizeEqual(expected_size, node.size)
+        # The node which is created without a size will have the placeholder
+        # size.
+        node = actual_nodes[node_no_size_id]
+        self.assertEqual('test-list_nodes-no-size', node.name)
+        self.assertEqual(NodeState.STOPPED, node.state)
+        expected_size = self.getSize('')
+        self.assertSizeEqual(expected_size, node.size)
 
     def test_destroy_node(self):
         """
@@ -485,7 +538,10 @@ class VirtualBoxNodeDriverTests(unittest.TestCase):
             self.sut.ex_rename_node(
                 node, 'test-ex_rename_node_running-renamed')
 
-        self.assertEqual('', context.exception.arg[0])
+        self.assertEqual(
+            'Only stopped machines can be reconfigured.',
+            context.exception.args[0],
+            )
 
     def test_ex_start_node_ex_stop_node_reboot_node(self):
         """
@@ -519,3 +575,47 @@ class VirtualBoxNodeDriverTests(unittest.TestCase):
         time.sleep(2)
         node = self.getNode(node_id)
         self.assertEqual(NodeState.STOPPED, node.state)
+
+    def test_create_node_size_unknown(self):
+        """
+        It doesn't support creating a node with the unknown size.
+        """
+        size = self.getSize('')
+        with self.assertRaises(RuntimeError) as context:
+            self.sut.create_node(
+                name='new-node-test_create_node_size_unknown',
+                image='mock-image',
+                auth='mock-auth',
+                size=size,
+                )
+
+        self.assertEqual(
+            'You need to specify an exact node size.',
+            context.exception.args[0])
+
+    def test_create_node_nat_no_remote_display(self):
+        """
+        It can create a node with internal NAT network.
+        """
+        image_id = self.addImage('test-image-Other_64-1-128-10')
+        image = self.getImage(image_id)
+        size = self.getSize('1_cpu-256_ram-30_disk')
+        settings_file = _absolute_test_path(
+            'vm', 'test_create_node_nat_no_remote_display.vbox')
+        auth = NodeAuthPassword(password='test-pass')
+
+        result = self.sut.create_node(
+            name='test_create_node_nat_no_remote_display',
+            image=image,
+            size=size,
+            auth=auth,
+            ex_network_type='nat',
+            ex_remote_display=-1,
+            ex_settings_files=settings_file,
+            )
+
+        self.assertIsInstance(result, Node)
+        # Set it for cleanup as soon as possible.
+        self.addCleanup(_delete_machine, result.id)
+        self.assertEqual('test_create_node_nat_no_remote_display', result.name)
+        self.assertSizeEqual(size, result.size)

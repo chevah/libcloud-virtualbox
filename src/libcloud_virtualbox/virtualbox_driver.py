@@ -15,7 +15,7 @@ from libcloud.compute.base import (
     NodeSize,
     StorageVolume,
     )
-from libcloud.compute.providers import set_driver
+
 from libcloud.compute.types import NodeState, StorageVolumeState
 from ZSI import FaultException
 
@@ -55,6 +55,12 @@ class VirtualBoxNodeDriver(NodeDriver):
     """
     Driver for VirtualBox via the web service API.
     """
+
+    features = {
+        'create_node': [
+            'password',
+            ],
+        }
 
     def __init__(self, host, port=18083, username='', password=''):
         options = {
@@ -135,6 +141,16 @@ class VirtualBoxNodeDriver(NodeDriver):
         else:  # pragma: no cover
             return ntpath.join(*args)
 
+    def _splitPath(self, *args):
+        """
+        Join the arguments as a path.
+        """
+        if '/' in args[0]:
+            # NT don't usually contain '/', while Linux/Unix can have '\'.
+            return posixpath.split(*args)
+        else:  # pragma: no cover
+            return ntpath.split(*args)
+
     def _getHardDisk(self, disk_id, read_only=False):
         """
         Return an IMedium for the hard disk with `disk_id`.
@@ -159,6 +175,23 @@ class VirtualBoxNodeDriver(NodeDriver):
         progress = hdd.deleteStorage()
         return self._waitForProgress(progress)
 
+    def _cloneMedium(self, source, target_path):
+        """
+        Clone the `source` medium to `target_path` and return the cloned
+        medium.
+        """
+        target = self._vbox.vbox.createMedium(
+            'VDI',
+            target_path,
+            self._vbox.constants.AccessMode_ReadWrite,
+            self._vbox.constants.DeviceType_HardDisk,
+            )
+
+        variant = (self._vbox.constants.MediumVariant_Standard,)
+        progress = source.cloneToBase(target, variant)
+        self._waitForProgress(progress)
+        return target
+
     #
     # Node management
     #
@@ -171,13 +204,18 @@ class VirtualBoxNodeDriver(NodeDriver):
         :rtype: ``list`` of :class:`.Node`
         """
         result = []
+
+        available_sizes = {s.id: s for s in self.list_sizes()}
+
         for node in self._vbox.getArray(self._vbox.vbox, 'machines'):
             vbox_state = str(node.state)
             state = _get_libcloud_state(vbox_state)
+            size_id = str(node.getExtraData('libcloud_size'))
             result.append(Node(
                 id=str(node.id),
                 name=str(node.name),
                 state=state,
+                size=available_sizes.get(size_id),
                 public_ips=[],
                 private_ips=[],
                 driver=self,
@@ -189,7 +227,10 @@ class VirtualBoxNodeDriver(NodeDriver):
 
     def list_sizes(self, location=None):
         """
-        List sizes on a provider
+        List sizes on a provider.
+
+        It has a special size with id emptry string, which is a placeholder
+        for nodes which don't have a size. Maybe created using other tools.
 
         :param location: The location at which to list sizes
         :type location: :class:`.NodeLocation`
@@ -213,6 +254,17 @@ class VirtualBoxNodeDriver(NodeDriver):
                         driver=self,
                         extra={'cpu': cpu_size}
                         ))
+
+        result.append(NodeSize(
+            id='',
+            name='Unknown',
+            ram=0,
+            disk=0,
+            bandwidth=0,
+            price=0,
+            driver=self,
+            extra={'cpu': 0}
+            ))
         return result
 
     def list_locations(self):
@@ -231,14 +283,150 @@ class VirtualBoxNodeDriver(NodeDriver):
             driver=self,
             )]
 
-    def create_node(self, **kwargs):
+    def create_node(
+        self, name, image, size, auth,
+        ex_network_type='nat', ex_network_value='',
+        ex_remote_display=-1, ex_settings_files='',
+            ):
         """
         Create a new node instance. This instance will be started
         automatically.
 
+        :param node: Name of the new node.
+        :type node: `str`
+
+        :param image: Image from which this node is created.
+        :type image: :class:`.NodeImage`
+
+        :param size: Size of the new node.
+        :type size: :class:`.NodeSize`
+
+        :param size: Authentication object for the new node.
+        :type size: :class:`.NodeAuthPassword`
+
+        :param ex_network_type: The type of the network to attach to the node.
+        :type ex_network_type: `str`
+
+        :param ex_network_value: See `network_type`.
+        :type ex_network_value: `str`
+
+        :param ex_remote_display: Port on which to listen for remote display
+            connections.
+        :type ex_remote_display: `int`
+
+        :param ex_network_value: See `network_type`.
+        :type ex_network_value: `str`
+
         :return: The newly created node.
         :rtype: :class:`.Node`
         """
+        if not size.id:
+            raise RuntimeError('You need to specify an exact node size.')
+
+        # Extract image meta-data from image name.
+        parts = image.name.split('-')
+        minimum_disk = int(parts[-1])
+        minimum_memory = int(parts[-2])
+        minimum_cpu = int(parts[-3])
+        os_type = parts[-4]
+
+        groups = []  # For now we don't use any groups.
+        flags = ''  # We don't pass any special flags.
+        new_machine = self._vbox.vbox.createMachine(
+            ex_settings_files,
+            name,
+            groups,
+            os_type,
+            flags,
+            )
+
+        # Advertise the libcloud size of the new node.
+        new_machine.setExtraData('libcloud_size', size.id)
+        # Set the disk size and the initial password so that at boot the
+        # image can get them via dmidecode.
+        new_machine.setExtraData(
+            'VBoxInternal/Devices/pcbios/0/Config/DmiOEMVBoxVer',
+            'libcloud_initialization',
+            )
+        new_machine.setExtraData(
+            'VBoxInternal/Devices/pcbios/0/Config/DmiOEMVBoxRev',
+            '%s %s' % (size.disk, auth.password)
+            )
+        # Set CPU and memory size.
+        new_machine.memorySize = size.ram
+        new_machine.CPUCount = size.extra['cpu']
+        new_machine.VRAMSize = 64
+
+        # Set network.
+        network = new_machine.getNetworkAdapter(0)
+        # Set as Intel network card.
+        network.adapterType = self._vbox.constants.NetworkAdapterType_I82540EM
+        # Generate a new MAC address.
+        network.MACAddress = b''
+
+        if ex_network_type == 'nat':
+            network_type = self._vbox.constants.NetworkAttachmentType_NAT
+        elif ex_network_type == 'nat_network':
+            network_type = (
+                self._vbox.constants.NetworkAttachmentType_NATNetwork)
+        elif ex_network_type == 'bridged':
+            network_type = self._vbox.constants.NetworkAttachmentType_Bridged
+        elif ex_network_type == 'internal':
+            network_type = self._vbox.constants.NetworkAttachmentType_Internal
+        elif ex_network_type == 'host_only':
+            network_type = self._vbox.constants.NetworkAttachmentType_HostOnly
+        else:
+            raise RuntimeError(
+                'Unknown ex_network_type value: %s' % (ex_network_type,))
+
+        network.attachmentType = network_type
+        ex_network_value = ex_network_value.encode('ascii')
+        network.bridgedInterface = ex_network_value
+        network.NATNetwork = ex_network_value
+        network.hostOnlyInterface = ex_network_value
+        network.internalNetwork = ex_network_value
+
+        # We need the machine registered in order to attach the hdd so we do
+        # this mid-way save.
+        new_machine.saveSettings()
+        self._vbox.vbox.registerMachine(new_machine)
+
+        # Check that the new machine was registered
+        node_id = str(new_machine.id)
+        nodes = {node.id: node for node in self.list_nodes()}
+        new_node = nodes.get(node_id, None)
+        if not new_node:
+            raise RuntimeError(
+                'Node was created, but then could not be found.')
+
+        # Clone new disk from image.
+        machine_path = str(new_machine.settingsFilePath)
+        base_path, _ = self._splitPath(machine_path)
+        source = self._getHardDisk(image.id, read_only=True)
+        hdd_path = self._joinPath(base_path, 'volumes', name + '.vdi')
+        hdd = self._cloneMedium(
+            source=source,
+            target_path=hdd_path,
+            )
+
+        # Get the node again, in the case in which the clone operation takes
+        # a long time and the previous node reference was invalidated.
+        new_node = nodes.get(node_id)
+        with self._getMutableMachine(new_node) as mutable:
+            # Attach the new clone.
+            controller = mutable.addStorageController(
+                'SATA', self._vbox.constants.StorageBus_SATA)
+            controller.controllerType = (
+                self._vbox.constants.StorageControllerType_IntelAhci)
+            mutable.attachDevice(
+                'SATA',
+                0,
+                0,
+                self._vbox.constants.DeviceType_HardDisk,
+                hdd,
+                )
+
+        return new_node
 
     def reboot_node(self, node):
         """
@@ -330,10 +518,12 @@ class VirtualBoxNodeDriver(NodeDriver):
 
             # Size for libcloud is in GB.
             size = long(disk.logicalSize) / (1024 * 1000 * 1000)
+            # Remove the extension for the image names.
+            name, _ = posixpath.splitext(str(disk.name))
 
             result.append(StorageVolume(
                 id=str(disk.id),
-                name=str(disk.name),
+                name=name,
                 size=int(size),
                 state=StorageVolumeState.AVAILABLE,
                 driver=self,
@@ -392,17 +582,8 @@ class VirtualBoxNodeDriver(NodeDriver):
             vbox_size, (self._vbox.constants.MediumVariant_Fixed,))
         self._waitForProgress(progress)
 
-        return StorageVolume(
-            id=str(disk.id),
-            name=str(disk.name),
-            size=size,
-            state=StorageVolumeState.AVAILABLE,
-            driver=self,
-            extra={
-                'location': str(disk.location),
-                'actual_size': long(disk.size)
-                },
-            )
+        volumes = {v.id: v for v in self.list_volumes()}
+        return volumes[str(disk.id)]
 
     def create_volume_snapshot(self, volume, name=None):
         """
@@ -557,9 +738,12 @@ class VirtualBoxNodeDriver(NodeDriver):
             if not str(disk.location).startswith(self._images_path):
                 continue
 
+            # Remove the extension for the image names.
+            name, _ = posixpath.splitext(str(disk.name))
+
             result.append(NodeImage(
-                id=str(disk.getId()),
-                name=str(disk.getName()),
+                id=str(disk.id),
+                name=name,
                 driver=self,
                 extra={'location': str(disk.location)},
                 ))
@@ -596,23 +780,11 @@ class VirtualBoxNodeDriver(NodeDriver):
             raise RuntimeError('Node has no attached disk.')
 
         path = self._joinPath(self._images_path, name + '.vdi')
-        target = self._vbox.vbox.createMedium(
-            'VDI',
-            path,
-            self._vbox.constants.AccessMode_ReadWrite,
-            self._vbox.constants.DeviceType_HardDisk,
+        target = self._cloneMedium(
+            source=medium,
+            target_path=path,
             )
-
-        variant = (self._vbox.constants.MediumVariant_Standard,)
-        progress = medium.cloneToBase(target, variant)
-        self._waitForProgress(progress)
-
-        return NodeImage(
-            id=str(target.id),
-            name=str(target.name),
-            driver=self,
-            extra={'location': str(target.location)},
-            )
+        return self.get_image(str(target.id))
 
     def delete_image(self, node_image):
         """
@@ -636,13 +808,8 @@ class VirtualBoxNodeDriver(NodeDriver):
         :rtype :class:`.NodeImage`:
         :return: NodeImage instance on success.
         """
-        disk = self._getHardDisk(image_id, read_only=True)
-        return NodeImage(
-            id=str(disk.id),
-            name=str(disk.name),
-            driver=self,
-            extra={'location': str(disk.location)},
-            )
+        images = {i.id: i for i in self.list_images()}
+        return images[image_id]
 
     def copy_image(self, source_region, node_image, name, description=None):
         """
@@ -704,11 +871,3 @@ def _get_libcloud_state(vbox_state):
         'teleported': NodeState.STOPPED,
         }
     return mapping.get(vbox_state.lower(), NodeState.UNKNOWN)
-
-
-# Add the libcloud 3rd party driver for VirtualBox.
-set_driver(
-    'virtualbox',
-    'libcloud_virtualbox.virtualbox_driver',
-    'VirtualBoxNodeDriver',
-    )
